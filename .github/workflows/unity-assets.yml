@@ -1,0 +1,275 @@
+name: MySim remote Unity integration
+run-name: Unity integration ${{ inputs.manifest_sha256 }}
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_sha256:
+        description: SHA256 of the final source-bound intake manifest
+        required: true
+      project_sha256:
+        description: SHA256 of the isolated project snapshot archive
+        required: true
+      shards:
+        description: Nonempty mesh validation shards
+        type: number
+        default: 1
+      license_workers:
+        description: Authorized concurrent Unity licenses (not GitHub account capacity)
+        type: number
+        default: 1
+      build_player:
+        description: Build Linux player after validated track integration
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: mysim-unity-integration
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONPATH: unity-pipeline/tools
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      tracks: ${{ steps.plan.outputs.tracks }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: unity-pipeline
+          persist-credentials: false
+      - name: Check configured CI entitlement and pinned inputs
+        env:
+          LICENSE_SLOTS: ${{ vars.MYSIM_UNITY_LICENSE_SLOTS }}
+          WORKERS: ${{ inputs.license_workers }}
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_LICENSING_SERVER: ${{ secrets.UNITY_LICENSING_SERVER }}
+        run: |
+          python - <<'PY'
+          import os
+          workers=int(os.environ['WORKERS']); slots=int(os.environ.get('LICENSE_SLOTS') or '0')
+          if not 1 <= workers <= slots: raise SystemExit('Configure MYSIM_UNITY_LICENSE_SLOTS for your actual CI entitlement before running Unity.')
+          if not os.environ['UNITY_LICENSING_SERVER'] and not ((os.environ['UNITY_LICENSE'] or os.environ['UNITY_SERIAL']) and os.environ['UNITY_EMAIL'] and os.environ['UNITY_PASSWORD']):
+              raise SystemExit('Unity CI activation secrets or a licensing server are required. No local Unity execution will occur.')
+          PY
+      - name: Fetch immutable intake manifest
+        env:
+          MYSIM_MANIFEST_URL: ${{ secrets.MYSIM_UNITY_MANIFEST_URL }}
+          MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+        run: python unity-pipeline/tools/intake.py fetch --url-env MYSIM_MANIFEST_URL --sha "$MANIFEST_SHA" --output manifest.json --limit-gib 0.05
+      - name: Plan unique work
+        id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+          WORKERS: ${{ inputs.license_workers }}
+        run: |
+          python unity-pipeline/tools/ci.py plan --manifest manifest.json --shards "$SHARDS" --license-workers "$WORKERS" > plan.json
+          python - <<'PY'
+          import os,json
+          p=json.load(open('plan.json'))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('shards='+json.dumps(p['shards'])+'\ntracks='+json.dumps(p['tracks'])+'\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unity-intake-manifest
+          path: manifest.json
+          if-no-files-found: error
+          retention-days: 7
+  validate:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.license_workers }}
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: Set absolute compute deadline
+        id: budget
+        run: echo "deadline=$(( $(date +%s) + 16200 ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: unity-pipeline
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unity-intake-manifest
+      - name: Start remote resource watchdog
+        run: nohup sudo python3 unity-pipeline/tools/resource_watch.py --deadline "${{ steps.budget.outputs.deadline }}" --report /tmp/mysim-resource-watch.json >/tmp/mysim-resource-watch.log 2>&1 &
+      - name: Prepare isolated project and candidate inputs
+        timeout-minutes: 30
+        env:
+          MYSIM_PROJECT_URL: ${{ secrets.MYSIM_PROJECT_URL }}
+          PROJECT_SHA: ${{ inputs.project_sha256 }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python unity-pipeline/tools/ci.py project --output project --sha "$PROJECT_SHA"
+          python unity-pipeline/tools/intake.py prepare --manifest manifest.json --project project --workspace intake --shard "$SHARD" --shards "$SHARDS"
+      - name: Export original UV channels and source-relative geometry on remote CPU
+        timeout-minutes: 45
+        run: |
+          curl --fail --location --retry 8 --retry-all-errors --connect-timeout 30 --max-time 600 https://download.blender.org/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz -o /tmp/blender.tar.xz
+          curl --fail --location --retry 8 --max-time 120 https://download.blender.org/release/Blender4.5/blender-4.5.14.sha256 -o /tmp/blender.sha256
+          python - <<'PY'
+          import hashlib
+          lines=open('/tmp/blender.sha256').read().splitlines()
+          expected=next(line.split()[0] for line in lines if line.split()[-1].lstrip('*')=='blender-4.5.14-linux-x64.tar.xz')
+          h=hashlib.sha256()
+          with open('/tmp/blender.tar.xz','rb') as f:
+              for b in iter(lambda:f.read(4194304),b''):h.update(b)
+          assert h.hexdigest()==expected,'Blender download SHA mismatch'
+          PY
+          mkdir -p /tmp/blender
+          tar -xf /tmp/blender.tar.xz -C /tmp/blender --strip-components=1
+          rm /tmp/blender.tar.xz
+          timeout --signal=TERM 16200 /tmp/blender/blender --background --factory-startup --disable-autoexec --python unity-pipeline/tools/export_blend.py -- --workspace "$GITHUB_WORKSPACE/intake"
+      - name: Unity import and source fidelity checks
+        timeout-minutes: 180
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: project
+          unityVersion: 6000.3.26f1
+          targetPlatform: StandaloneLinux64
+          versioning: None
+          buildMethod: MySim.Remote.RemoteCI.Run
+          unityLicensingServer: ${{ secrets.UNITY_LICENSING_SERVER }}
+          customParameters: -nographics -mysimStage validate -mysimManifest /github/workspace/intake/shard.json -mysimInputRoot /github/workspace/intake -mysimOutputRoot /github/workspace/unity-out
+      - name: Seal passing output
+        run: python unity-pipeline/tools/ci.py seal --directory unity-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unity-validated-${{ matrix.shard }}
+          path: unity-out
+          if-no-files-found: warn
+          retention-days: 7
+  assemble:
+    needs: [plan, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.license_workers }}
+      matrix:
+        track: ${{ fromJSON(needs.plan.outputs.tracks) }}
+    steps:
+      - name: Set absolute compute deadline
+        id: budget
+        run: echo "deadline=$(( $(date +%s) + 16200 ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: unity-pipeline
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unity-intake-manifest
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: unity-validated-*
+          path: verified-inputs
+      - name: Start remote resource watchdog
+        run: nohup sudo python3 unity-pipeline/tools/resource_watch.py --deadline "${{ steps.budget.outputs.deadline }}" --report /tmp/mysim-resource-watch.json >/tmp/mysim-resource-watch.log 2>&1 &
+      - name: Verify all source shards before track assembly
+        timeout-minutes: 30
+        env:
+          MYSIM_PROJECT_URL: ${{ secrets.MYSIM_PROJECT_URL }}
+          PROJECT_SHA: ${{ inputs.project_sha256 }}
+        run: |
+          python unity-pipeline/tools/ci.py verify --directory verified-inputs --manifest manifest.json --stage validate
+          python unity-pipeline/tools/ci.py project --output project --sha "$PROJECT_SHA"
+      - name: Assemble track while retaining original collision and reference identities
+        timeout-minutes: 240
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: project
+          unityVersion: 6000.3.26f1
+          targetPlatform: StandaloneLinux64
+          versioning: None
+          buildMethod: MySim.Remote.RemoteCI.Run
+          unityLicensingServer: ${{ secrets.UNITY_LICENSING_SERVER }}
+          customParameters: -nographics -mysimStage assemble -mysimManifest /github/workspace/manifest.json -mysimInputRoot /github/workspace/verified-inputs -mysimPackages /github/workspace/verified-inputs -mysimOutputRoot /github/workspace/unity-out -mysimTrack ${{ matrix.track }}
+      - name: Seal passing track output
+        run: python unity-pipeline/tools/ci.py seal --directory unity-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unity-track-${{ matrix.track }}
+          path: unity-out
+          if-no-files-found: warn
+          retention-days: 7
+  build:
+    if: inputs.build_player
+    needs: [plan, assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Set absolute compute deadline
+        id: budget
+        run: echo "deadline=$(( $(date +%s) + 16200 ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: unity-pipeline
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unity-intake-manifest
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: unity-track-*
+          path: verified-tracks
+      - name: Start remote resource watchdog
+        run: nohup sudo python3 unity-pipeline/tools/resource_watch.py --deadline "${{ steps.budget.outputs.deadline }}" --report /tmp/mysim-resource-watch.json >/tmp/mysim-resource-watch.log 2>&1 &
+      - name: Verify track inventory and prepare isolated final project
+        timeout-minutes: 30
+        env:
+          MYSIM_PROJECT_URL: ${{ secrets.MYSIM_PROJECT_URL }}
+          PROJECT_SHA: ${{ inputs.project_sha256 }}
+        run: |
+          python unity-pipeline/tools/ci.py verify --directory verified-tracks --manifest manifest.json --stage assemble
+          python unity-pipeline/tools/ci.py project --output project --sha "$PROJECT_SHA"
+      - name: Build integrated Linux player on remote CPU
+        timeout-minutes: 240
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: project
+          unityVersion: 6000.3.26f1
+          targetPlatform: StandaloneLinux64
+          versioning: None
+          buildMethod: MySim.Remote.RemoteCI.Run
+          unityLicensingServer: ${{ secrets.UNITY_LICENSING_SERVER }}
+          customParameters: -nographics -mysimStage build -mysimManifest /github/workspace/manifest.json -mysimInputRoot /github/workspace/verified-tracks -mysimPackages /github/workspace/verified-tracks -mysimOutputRoot /github/workspace/unity-out
+      - name: Seal final build
+        run: python unity-pipeline/tools/ci.py seal --directory unity-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unity-integrated-build
+          path: unity-out
+          if-no-files-found: warn
+          retention-days: 7
