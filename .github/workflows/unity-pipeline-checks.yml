@@ -1,0 +1,21 @@
+name: Unity pipeline protocol checks
+on:
+  pull_request:
+    paths: ['unity-pipeline/**', '.github/workflows/unity-*.yml']
+  push:
+    paths: ['unity-pipeline/**', '.github/workflows/unity-*.yml']
+permissions:
+  contents: read
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: unity-pipeline
+          persist-credentials: false
+      - name: Test verified intake, UV transport and publication gates without Unity
+        run: |
+          python3 -m unittest discover -s unity-pipeline/tests -v
+          python3 -m compileall -q unity-pipeline/tools

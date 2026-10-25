@@ -1,0 +1,141 @@
+name: MySim Unity dependency node
+run-name: MySim Unity node ${{ inputs.node_id }} ${{ inputs.dispatch_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      node_id: {required: true, type: string}
+      spec_sha256: {required: true, type: string}
+      dispatch_id: {required: true, type: string}
+permissions:
+  contents: read
+concurrency:
+  group: mysim-unity-node-${{ inputs.node_id }}
+  cancel-in-progress: false
+env:
+  PYTHONPATH: unity-pipeline/tools
+jobs:
+  node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Set absolute compute deadline
+        id: budget
+        run: echo "deadline=$(( $(date +%s) + 16200 ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: |
+            unity-pipeline
+            unity-inputs
+          persist-credentials: false
+      - name: Check frozen node identity and lease
+        id: spec
+        env:
+          NODE: ${{ inputs.node_id }}
+          SHA: ${{ inputs.spec_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import os,re,json,hashlib
+          from pathlib import Path
+          n=os.environ['NODE'];assert re.fullmatch('[a-zA-Z0-9_-]{1,80}',n)
+          p=Path('unity-inputs')/(n+'.json');assert hashlib.sha256(p.read_bytes()).hexdigest()==os.environ['SHA']
+          d=json.loads(p.read_text());assert d['id']==n and d['stage'] in ['export','validate','finish-track','build']
+          if d['stage']!='export':assert d.get('leaseId'),'Unity nodes require centrally reserved license capacity'
+          track=d.get('track','');assert not track or re.fullmatch('[a-zA-Z0-9_-]{1,64}',track)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('stage='+d['stage']+'\ntrack='+track+'\n')
+          PY
+      - name: Check Unity activation for licensed stages
+        if: steps.spec.outputs.stage != 'export'
+        env:
+          LICENSE_SLOTS: ${{ vars.MYSIM_UNITY_LICENSE_SLOTS }}
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_LICENSING_SERVER: ${{ secrets.UNITY_LICENSING_SERVER }}
+        run: |
+          python3 - <<'PY'
+          import os
+          assert int(os.environ.get('LICENSE_SLOTS') or '0')>=1
+          assert os.environ['UNITY_LICENSING_SERVER'] or ((os.environ['UNITY_LICENSE'] or os.environ['UNITY_SERIAL']) and os.environ['UNITY_EMAIL'] and os.environ['UNITY_PASSWORD']),'Unity activation missing'
+          PY
+      - name: Start remote resource watchdog
+        run: nohup sudo python3 unity-pipeline/tools/resource_watch.py --deadline "${{ steps.budget.outputs.deadline }}" --report /tmp/mysim-resource-watch.json >/tmp/mysim-resource-watch.log 2>&1 &
+      - name: Prepare verified source or dependency inputs
+        timeout-minutes: 45
+        env:
+          MYSIM_PROJECT_URL: ${{ secrets.MYSIM_PROJECT_URL }}
+          NODE: ${{ inputs.node_id }}
+          SHA: ${{ inputs.spec_sha256 }}
+        run: python3 unity-pipeline/tools/node.py --spec "unity-inputs/$NODE.json" --sha "$SHA"
+      - name: Export geometry and original UVs on CPU without Unity licensing
+        if: steps.spec.outputs.stage == 'export'
+        timeout-minutes: 180
+        run: |
+          curl --fail --location --retry 4 --retry-all-errors --max-time 600 https://download.blender.org/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz -o /tmp/blender.tar.xz
+          curl --fail --location --retry 4 --max-time 120 https://download.blender.org/release/Blender4.5/blender-4.5.14.sha256 -o /tmp/blender.sha256
+          python3 - <<'PY'
+          import hashlib
+          expected=next(l.split()[0] for l in open('/tmp/blender.sha256') if l.split()[-1].lstrip('*')=='blender-4.5.14-linux-x64.tar.xz')
+          h=hashlib.sha256()
+          with open('/tmp/blender.tar.xz','rb') as f:
+              for b in iter(lambda:f.read(4194304),b''):h.update(b)
+          assert h.hexdigest()==expected
+          PY
+          mkdir -p /tmp/blender && tar -xf /tmp/blender.tar.xz -C /tmp/blender --strip-components=1
+          rm /tmp/blender.tar.xz
+          /tmp/blender/blender --background --factory-startup --disable-autoexec --python unity-pipeline/tools/export_blend.py -- --workspace "$GITHUB_WORKSPACE/node-input/intake"
+          python3 unity-pipeline/tools/node.py --workspace node-input --package-export unity-out
+      - name: Validate Unity assets or build headlessly
+        if: steps.spec.outputs.stage == 'validate' || steps.spec.outputs.stage == 'build'
+        timeout-minutes: 220
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: project
+          unityVersion: 6000.3.26f1
+          targetPlatform: StandaloneLinux64
+          versioning: None
+          buildMethod: MySim.Remote.RemoteCI.Run
+          unityLicensingServer: ${{ secrets.UNITY_LICENSING_SERVER }}
+          customParameters: -nographics -mysimStage ${{ steps.spec.outputs.stage }} -mysimManifest /github/workspace/node-input/manifest.json -mysimInputRoot /github/workspace/node-input/intake -mysimPackages /github/workspace/node-input/packages -mysimOutputRoot /github/workspace/unity-out
+      - name: Assemble and capture this track using the same Editor process
+        if: steps.spec.outputs.stage == 'finish-track'
+        timeout-minutes: 220
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: project
+          unityVersion: 6000.3.26f1
+          targetPlatform: StandaloneLinux64
+          versioning: None
+          buildMethod: MySim.Remote.RemoteCI.Run
+          unityLicensingServer: ${{ secrets.UNITY_LICENSING_SERVER }}
+          enableGpu: true
+          customParameters: -force-glcore -mysimStage finish-track -mysimTrack ${{ steps.spec.outputs.track }} -mysimManifest /github/workspace/node-input/manifest.json -mysimInputRoot /github/workspace/node-input/intake -mysimPackages /github/workspace/node-input/packages/validate -mysimOutputRoot /github/workspace/unity-out
+      - name: Seal immutable node outputs
+        run: |
+          python3 unity-pipeline/tools/ci.py seal --directory unity-out
+          python3 - <<'PY'
+          import zipfile,pathlib
+          with zipfile.ZipFile('unity-node-output.zip','w',compression=zipfile.ZIP_DEFLATED) as z:
+              for p in pathlib.Path('unity-out').rglob('*'):
+                  if p.is_file():z.write(p,p.relative_to('unity-out'))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: unity-node-${{ inputs.node_id }}
+          path: |
+            unity-node-output.zip
+            unity-out/report.json
+            unity-out/render-review.json
+          if-no-files-found: warn
+          retention-days: 7

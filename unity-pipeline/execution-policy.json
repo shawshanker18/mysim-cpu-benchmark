@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "requestedMachinePool": 190,
+  "poolSource": "User-reported target; verify actual free slots before reservations",
+  "verifiedMachinePool": null,
+  "renderScope": "tracks_and_representative_mesh_spot_checks",
+  "spotChecksPerTrack": 8,
+  "renderResolution": [1920, 1080],
+  "geometryQuality": "Preserve accepted candidate geometry and source LOD semantics",
+  "softwareRendererRequired": true,
+  "localUnityAllowed": false,
+  "paidRunnersAllowed": false,
+  "api": {
+    "userHardLimitPerHour": 5000,
+    "controllerLimitPerHour": 4000,
+    "externalActorReserve": 1000,
+    "minimumRequestIntervalSeconds": 1.0,
+    "minimumMutationIntervalSeconds": 1.0,
+    "pollRepositoriesEverySeconds": 60,
+    "jobDetailsMinimumAgeSeconds": 300,
+    "countConditionalRequestsAgainstLocalBudget": true,
+    "rotateCredentialsToEvadeLimits": false
+  },
+  "compute": {
+    "wholeJobMinutes": 300,
+    "computeCutoffMinutes": 270,
+    "processMemoryGiB": 12,
+    "planningMemoryHeadroomGiB": 2,
+    "outputLimitGiB": 1,
+    "batchRuntimeUtilization": 0.8,
+    "batchOutputUtilization": 0.8
+  },
+  "acceptance": {
+    "sourceBindingsRequired": true,
+    "originalCollisionRequired": true,
+    "encodedUV1Preserved": true,
+    "actualTrackImagesRequired": true,
+    "shadowReviewRequired": true,
+    "successfulPlayerBuildRequired": true,
+    "launchAndDrivingTestsRequired": true,
+    "balancedShadowsVerified": false,
+    "gamePlayableVerified": false
+  }
+}
