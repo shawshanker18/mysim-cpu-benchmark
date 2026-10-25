@@ -237,16 +237,21 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: unity-track-*
-          path: verified-tracks
+          path: verified-tracks/tracks
       - name: Start remote resource watchdog
         run: nohup sudo python3 unity-pipeline/tools/resource_watch.py --deadline "${{ steps.budget.outputs.deadline }}" --report /tmp/mysim-resource-watch.json >/tmp/mysim-resource-watch.log 2>&1 &
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: unity-validated-*
+          path: verified-tracks/meshes
       - name: Verify track inventory and prepare isolated final project
         timeout-minutes: 30
         env:
           MYSIM_PROJECT_URL: ${{ secrets.MYSIM_PROJECT_URL }}
           PROJECT_SHA: ${{ inputs.project_sha256 }}
         run: |
-          python unity-pipeline/tools/ci.py verify --directory verified-tracks --manifest manifest.json --stage assemble
+          python unity-pipeline/tools/ci.py verify --directory verified-tracks/tracks --manifest manifest.json --stage assemble
+          python unity-pipeline/tools/ci.py verify --directory verified-tracks/meshes --manifest manifest.json --stage validate
           python unity-pipeline/tools/ci.py project --output project --sha "$PROJECT_SHA"
       - name: Build integrated Linux player on remote CPU
         timeout-minutes: 240

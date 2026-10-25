@@ -104,12 +104,15 @@ def prepare(manifest,project,workspace,shard,shards,stage):
  m=validate_manifest(json.loads(Path(manifest).read_text()));w=Path(workspace);w.mkdir(parents=True,exist_ok=True)
  selected=sorted(m['entries'],key=lambda e:e['id'])[shard::shards]
  if not selected:raise ValueError('Empty shard, not padding work')
- version=(Path(project)/'ProjectSettings/ProjectVersion.txt').read_text()
- if f'm_EditorVersion: {UNITY_VERSION}' not in version:raise ValueError('Project version differs from pinned version')
+ if project is not None:
+  version=(Path(project)/'ProjectSettings/ProjectVersion.txt').read_text()
+  if f'm_EditorVersion: {UNITY_VERSION}' not in version:raise ValueError('Project version differs from pinned version')
+ elif stage!='export':raise ValueError('Only CPU exchange may precede Unity source-asset verification')
  archive_cache={}
  for e in selected:
-  source=safe_path(project,e['sourceAsset'])
-  if not source.is_file() or digest(source)!=e['sourceSha256']:raise ValueError('Unity source asset SHA mismatch: '+e['id'])
+  if project is not None:
+   source=safe_path(project,e['sourceAsset'])
+   if not source.is_file() or digest(source)!=e['sourceSha256']:raise ValueError('Unity source asset SHA mismatch: '+e['id'])
   directory=w/'meshes'/e['id'];directory.mkdir(parents=True,exist_ok=True)
   sha=e['archiveSha256'];archive=w/'downloads'/(sha+'.zip')
   if sha not in archive_cache:

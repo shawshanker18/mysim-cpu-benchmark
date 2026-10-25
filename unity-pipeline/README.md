@@ -1,5 +1,19 @@
 # MySim remote Unity integration
 
+## Fast path selected2026-10-25
+
+The requested pool target is190 workers, not a verified running count. The selected scope is assembled-track renders plus8 representative mesh spot checks per track, at1920x1080; it does not generate images for all98,572 meshes.
+
+`execution-policy.json`, `fast_plan.py`, `chain_state.py`, `freeze_node.py`, `node.py`, `dispatch_node.py` and `unity-node.yml` implement the dependency-local path: CPU-only export → unique source validation → track-local assembly/render in one Editor → final build. Export does not reserve a Unity license. A ready track need not wait for unrelated tracks. Input packages are immutable HTTPS deliveries with SHA256 checks; no per-mesh API upload or status polling is used. Dependency package delivery URLs must be supplied by the verified collector/storage path before freezing dependent nodes.
+
+The shared SQLite API governor counts all controller attempts, even conditional304requests, against a4000-request rolling-hour cap, with1-second pacing and1000requests of headroom under the user's5000limit. It honors GitHub reset/Retry-After headers, stops on errors, never rotates credentials to escape limits, and never automatically retries an uncertain dispatch. All controlling clients must use the same budget file; unrelated legacy API clients are not magically governed. The dispatcher refuses activation until the capacity snapshot confirms competing API actors have been reconciled/budgeted. No new polling daemon has been started.
+
+Use a fresh verified capacity snapshot, actual Unity license entitlement and an immutable node tag before `dispatch_node.py --apply`. It defaults to a no-dispatch dry run. Pending/uncertain reservations survive restart; only a confirmed terminal job and verified receipt complete a node. Ready Unity validation/track finishes take priority over more CPU exports. Existing mesh jobs and their controller are untouched.
+
+Track rendering requests a CPU software graphics device, not `-nographics`; the GameCI `enableGpu` option only enables graphics initialization here. No hardware GPU is attached/requested. The code explicitly rejects devices not identified as software rasterizers. The initial llvmpipe/OpenGL pilot remains unvalidated. Baseline/candidate pictures, blank-frame checks, original lighting state and dark/bright pixel statistics are collected. Source lights are preserved, not declared balanced. `shadowsBalanced` and gameplay acceptance remain false until actual review and driving tests pass.
+
+For a raw timing scenario:98,572/190 is about519meshes/worker.10,30or60seconds per mesh correspond to1.44,4.32or8.65worker-parallel hours before transfer/import/assembly. The chosen track+spot-check scope renders far fewer images; its real estimate depends on track/camera counts and the first pilot. No scenario is a measured completion promise.
+
 Built for the recovered project's exact `6000.3.26f1` version. The original project is read only during preparation. Unity import, validation, track edits and player builds run in disposable GitHub-hosted Linux jobs, never in the local Editor.
 
 ## Pipeline

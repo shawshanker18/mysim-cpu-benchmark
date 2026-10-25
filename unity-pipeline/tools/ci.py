@@ -68,14 +68,15 @@ def verify_results(root,manifest,stage):
   for track in report.get('tracks',[]):
    if track in track_ids:raise ValueError('Duplicate assembled track')
    track_ids.add(track)
-  allowed=[t['sourcePrefab'] for t in expected['tracks'] if t['id'] in report.get('tracks',[])] if stage=='assemble' else []
+  allowed=[t['sourcePrefab'] for t in expected['tracks'] if t['id'] in report.get('tracks',[])] if stage in ('assemble','finish-track') else []
   packages=list(proof.parent.glob('*.unitypackage'))
-  if not packages:raise ValueError('Passing report has no generated Unity package')
+  if not packages and stage!='export':raise ValueError('Passing report has no generated Unity package')
+  if stage=='export' and any(not (proof.parent/'meshes'/ident/'mesh-index.json').exists() for ident in report['ids']):raise ValueError('Missing CPU exchange inventory')
   for package in packages:verify_package(package,allowed)
   reports.append(report)
  if not reports:raise ValueError('No verified Unity worker outputs')
  if seen!={e['id'] for e in expected['entries']}:raise ValueError('Missing or extraneous verified sources')
- if stage=='assemble' and track_ids!={t['id'] for t in expected['tracks']}:raise ValueError('Missing assembled tracks')
+ if stage in ('assemble','finish-track') and track_ids!={t['id'] for t in expected['tracks']}:raise ValueError('Missing assembled tracks')
  return seen
 
 def main():
@@ -83,7 +84,7 @@ def main():
  a=sub.add_parser('plan');a.add_argument('--manifest',required=True);a.add_argument('--shards',type=int,required=True);a.add_argument('--license-workers',type=int,required=True)
  a=sub.add_parser('project');a.add_argument('--output',required=True);a.add_argument('--sha',required=True)
  a=sub.add_parser('seal');a.add_argument('--directory',required=True)
- a=sub.add_parser('verify');a.add_argument('--directory',required=True);a.add_argument('--manifest',required=True);a.add_argument('--stage',choices=['validate','assemble'],required=True)
+ a=sub.add_parser('verify');a.add_argument('--directory',required=True);a.add_argument('--manifest',required=True);a.add_argument('--stage',choices=['export','validate','assemble','finish-track'],required=True)
  args=p.parse_args()
  if args.command=='plan':print(json.dumps(plan(args.manifest,args.shards,args.license_workers)))
  elif args.command=='project':project_snapshot(args.output,args.sha)

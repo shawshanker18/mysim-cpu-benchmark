@@ -10,11 +10,14 @@ using UnityEditor.Build.Reporting;
 using UnityEngine;
 using UnityEngine.Rendering;
 using Unity.Collections;
+using UnityEditor.SceneManagement;
 using Debug = UnityEngine.Debug;
 
 namespace MySim.Remote {
  [Serializable] public class Manifest { public int schema; public string unityVersion; public Entry[] entries; public Track[] tracks; public string[] buildScenes; }
- [Serializable] public class Track { public string id, sourcePrefab, sourcePrefabSha256; }
+ [Serializable] public class Track { public string id, sourcePrefab, sourcePrefabSha256, renderScene; public string[] renderCameraPaths, spotCheckIds; }
+ [Serializable] public class FrameResult { public string file, view, device; public double seconds, luminanceVariance, darkFraction, brightFraction; }
+ [Serializable] public class RenderReview { public bool imagesCaptured, sourceLightingPreserved, shadowsBalanced=false, gameplayVerified=false; public string track, graphicsDevice, baselineLighting, candidateLighting; public List<FrameResult> frames=new List<FrameResult>(); }
  [Serializable] public class Entry {
   public string id, sourceAsset, sourceSha256, sourceMesh, sourceFileId;
   public string[] trackIds, materialPaths; public float[] sourceToUnity, lodHeights;
@@ -51,9 +54,14 @@ namespace MySim.Remote {
     Require(Config.schema==1&&Config.unityVersion==Version&&Config.entries!=null,"Invalid intake manifest");
     if(stage=="validate") Validate();
     else if(stage=="assemble") Assemble(Arg("-mysimTrack")??throw new InvalidOperationException("Track ID required"));
+    else if(stage=="render") RenderComparison(Arg("-mysimTrack")??throw new InvalidOperationException("Track ID required"),()=>ImportPackages());
+    else if(stage=="finish-track") {
+     string id=Arg("-mysimTrack")??throw new InvalidOperationException("Track ID required");ImportPackages();
+     RenderComparison(id,()=>Assemble(id,false));
+    }
     else if(stage=="build") Build();
     else throw new InvalidOperationException("Unsupported stage");
-    WriteReport(stage,stage=="assemble"?new[]{Arg("-mysimTrack")}:new string[0],"Structural candidate checks passed; graphics/runtime acceptance remains pending");
+    WriteReport(stage,new[]{"assemble","render","finish-track"}.Contains(stage)?new[]{Arg("-mysimTrack")}:new string[0],"Structural/render capture checks passed where requested; shadow, graphics quality and gameplay acceptance remain pending");
    } catch(Exception ex) {
     File.WriteAllText(Path.Combine(Output,"report.json"),JsonUtility.ToJson(new Result{passed=false,stage=stage,unityVersion=Application.unityVersion,ids=Passed.ToArray(),detail=ex.ToString()},true));
     Debug.LogException(ex); throw;
@@ -157,7 +165,7 @@ namespace MySim.Remote {
   static void ImportPackages() {
    string directory=Arg("-mysimPackages")??throw new InvalidOperationException("Verified packages path required");
    string[] packages=Directory.GetFiles(directory,"*.unitypackage",SearchOption.AllDirectories);Require(packages.Length>0,"No verified packages");
-   foreach(string file in packages){Budget();AssetDatabase.ImportPackage(file,false);}AssetDatabase.Refresh();
+   foreach(string file in packages.OrderBy(p=>Path.GetFileName(p).StartsWith("track-",StringComparison.Ordinal)?1:0)){Budget();AssetDatabase.ImportPackage(file,false);}AssetDatabase.Refresh();
   }
   static string CollisionState(GameObject root) {
    return string.Join("\n",root.GetComponentsInChildren<Collider>(true).Select(c=>c.GetType().FullName+"|"+c.transform.localToWorldMatrix+"|"+EditorJsonUtility.ToJson(c)).OrderBy(x=>x));
@@ -165,8 +173,8 @@ namespace MySim.Remote {
   static HashSet<string> SourceObjectIds(GameObject root) {
    var result=new HashSet<string>();foreach(var t in root.GetComponentsInChildren<Transform>(true)){result.Add(Key(t.gameObject));foreach(var c in t.GetComponents<Component>()){Require(c!=null,"Missing script in source prefab");result.Add(Key(c));}}return result;
   }
-  static void Assemble(string trackId) {
-   ImportPackages();Track track=Config.tracks.Single(t=>t.id==trackId);Require(Hash(Full(track.sourcePrefab))==track.sourcePrefabSha256,"Source track prefab hash mismatch");
+  static void Assemble(string trackId,bool import=true) {
+   if(import)ImportPackages();Track track=Config.tracks.Single(t=>t.id==trackId);Require(Hash(Full(track.sourcePrefab))==track.sourcePrefabSha256,"Source track prefab hash mismatch");
    var original=AssetDatabase.LoadAssetAtPath<GameObject>(track.sourcePrefab);Require(original!=null,"Source track missing");var ids=SourceObjectIds(original);var root=PrefabUtility.LoadPrefabContents(track.sourcePrefab);
    var export=new List<string>{track.sourcePrefab};string before=CollisionState(root);
    try {
@@ -181,7 +189,7 @@ namespace MySim.Remote {
       bool inGroup=groups.Any(g=>g.GetLODs().Any(l=>l.renderers.Contains(old)));int levels=inGroup?1:e.lodHeights.Length;var renderers=new List<Renderer>[levels];for(int l=0;l<levels;l++)renderers[l]=new List<Renderer>();
       var container=new GameObject("MySimCandidate_"+e.id);container.transform.SetParent(filter.transform,false);
       for(int i=0;i<index.parts.Length;i++) {
-       var part=index.parts[i];if(part.lod>=levels)continue;string asset=AssetPath(e,i);Mesh mesh=AssetDatabase.LoadAssetAtPath<Mesh>(asset);Require(mesh!=null,"Validated part asset missing");if(!export.Contains(asset))export.Add(asset);
+       var part=index.parts[i];if(part.lod>=levels)continue;string asset=AssetPath(e,i);Mesh mesh=AssetDatabase.LoadAssetAtPath<Mesh>(asset);Require(mesh!=null,"Validated part asset missing");
        var child=new GameObject("part_"+i);child.layer=old.gameObject.layer;child.transform.SetParent(container.transform,false);GameObjectUtility.SetStaticEditorFlags(child,GameObjectUtility.GetStaticEditorFlags(old.gameObject));child.AddComponent<MeshFilter>().sharedMesh=mesh;
        var renderer=child.AddComponent<MeshRenderer>();renderer.sharedMaterials=materials;renderer.shadowCastingMode=old.shadowCastingMode;renderer.receiveShadows=old.receiveShadows;renderer.lightmapIndex=old.lightmapIndex;renderer.lightmapScaleOffset=old.lightmapScaleOffset;renderer.realtimeLightmapIndex=old.realtimeLightmapIndex;renderer.realtimeLightmapScaleOffset=old.realtimeLightmapScaleOffset;renderer.lightProbeUsage=old.lightProbeUsage;renderer.reflectionProbeUsage=old.reflectionProbeUsage;renderer.probeAnchor=old.probeAnchor;renderer.enabled=old.enabled;
        var block=new MaterialPropertyBlock();old.GetPropertyBlock(block);renderer.SetPropertyBlock(block);renderers[part.lod].Add(renderer);
@@ -197,6 +205,51 @@ namespace MySim.Remote {
    AssetDatabase.SaveAssets();AssetDatabase.ImportAsset(track.sourcePrefab,ImportAssetOptions.ForceUpdate);
    var after=AssetDatabase.LoadAssetAtPath<GameObject>(track.sourcePrefab);Require(ids.IsSubsetOf(SourceObjectIds(after)),"Original prefab GUID/fileIDs were not retained");
    AssetDatabase.ExportPackage(export.ToArray(),Path.Combine(Output,"track-"+trackId+".unitypackage"),ExportPackageOptions.Default);
+  }
+  static string HierarchyPath(Transform transform) { return transform.parent?HierarchyPath(transform.parent)+"/"+transform.name:transform.name; }
+  static string LightingState() {
+   var lights=UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Include,FindObjectsSortMode.None).Select(l=>HierarchyPath(l.transform)+"|"+l.type+"|"+l.color+"|"+l.intensity.ToString("R")+"|"+l.shadows+"|"+l.shadowStrength.ToString("R")+"|"+l.shadowBias.ToString("R")+"|"+l.shadowNormalBias.ToString("R")).OrderBy(x=>x);
+   return string.Join("\n",lights)+"\nambient="+RenderSettings.ambientMode+"|"+RenderSettings.ambientLight+"|"+RenderSettings.ambientIntensity.ToString("R")+"|shadowDistance="+QualitySettings.shadowDistance.ToString("R");
+  }
+  static void OpenRenderScene(Track track) {
+   Require(!string.IsNullOrEmpty(track.renderScene)&&File.Exists(Full(track.renderScene)),"Explicit project lighting/render scene required");
+   var scene=EditorSceneManager.OpenScene(track.renderScene,OpenSceneMode.Single);var prefab=AssetDatabase.LoadAssetAtPath<GameObject>(track.sourcePrefab);Require(prefab!=null,"Track prefab missing for render");
+   bool present=scene.GetRootGameObjects().SelectMany(g=>g.GetComponentsInChildren<Transform>(true)).Any(t=>PrefabUtility.GetCorrespondingObjectFromSource(t.gameObject)==prefab);
+   if(!present)PrefabUtility.InstantiatePrefab(prefab,scene);
+  }
+  static FrameResult Capture(Camera camera,string view,string file) {
+   Budget();var clock=Stopwatch.StartNew();var oldTarget=camera.targetTexture;var oldActive=RenderTexture.active;var rt=new RenderTexture(1920,1080,24,RenderTextureFormat.ARGB32);var image=new Texture2D(1920,1080,TextureFormat.RGBA32,false);
+   try {
+    if(GraphicsSettings.currentRenderPipeline!=null) {var request=new RenderPipeline.StandardRequest{destination=rt};Require(RenderPipeline.SupportsRenderRequest(camera,request),"Active render pipeline does not support offscreen frame requests");RenderPipeline.SubmitRenderRequest(camera,request);}
+    else {camera.targetTexture=rt;camera.Render();}
+    RenderTexture.active=rt;image.ReadPixels(new Rect(0,0,1920,1080),0,0);image.Apply();var pixels=image.GetPixels32();double sum=0,squares=0,dark=0,bright=0;
+    foreach(var c in pixels){double y=(c.r+c.g+c.b)/765.0;sum+=y;squares+=y*y;if(y<.04)dark++;if(y>.96)bright++;}
+    double mean=sum/pixels.Length,variance=squares/pixels.Length-mean*mean;Require(variance>1e-6,"Blank or uniform render rejected; inspect camera/graphics initialization");
+    File.WriteAllBytes(Path.Combine(Output,file),image.EncodeToPNG());return new FrameResult{file=file,view=view,device=SystemInfo.graphicsDeviceName,seconds=clock.Elapsed.TotalSeconds,luminanceVariance=variance,darkFraction=dark/pixels.Length,brightFraction=bright/pixels.Length};
+   } finally {camera.targetTexture=oldTarget;RenderTexture.active=oldActive;rt.Release();UnityEngine.Object.DestroyImmediate(rt);UnityEngine.Object.DestroyImmediate(image);}
+  }
+  static void RenderComparison(string trackId,Action applyCandidate) {
+   Require(SystemInfo.graphicsDeviceType!=GraphicsDeviceType.Null,"Rendering cannot use -nographics");string device=SystemInfo.graphicsDeviceName.ToLowerInvariant();
+   Require(new[]{"llvmpipe","softpipe","swiftshader","software","lavapipe"}.Any(device.Contains),"CPU software renderer required; no hardware GPU requested");
+   Track track=Config.tracks.Single(t=>t.id==trackId);Require(track.renderCameraPaths!=null&&track.renderCameraPaths.Length>0,"Explicit track viewpoints required before rendering");
+   var review=new RenderReview{track=trackId,graphicsDevice=SystemInfo.graphicsDeviceName};
+   for(int pass=0;pass<2;pass++) {
+    if(pass==1)applyCandidate();OpenRenderScene(track);var cameras=UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Include,FindObjectsSortMode.None);
+    string lighting=LightingState();if(pass==0)review.baselineLighting=lighting;else review.candidateLighting=lighting;
+    for(int i=0;i<track.renderCameraPaths.Length;i++) {
+     var matches=cameras.Where(c=>HierarchyPath(c.transform)==track.renderCameraPaths[i]).ToArray();Require(matches.Length==1,"Camera path missing or ambiguous");
+     review.frames.Add(Capture(matches[0],track.renderCameraPaths[i],(pass==0?"baseline-":"candidate-")+i.ToString("D2")+".png"));
+    }
+    if(pass==1)foreach(string id in track.spotCheckIds??new string[0]) {
+     var containers=UnityEngine.Object.FindObjectsByType<Transform>(FindObjectsInactive.Include,FindObjectsSortMode.None).Where(t=>t.name=="MySimCandidate_"+id).ToArray();Require(containers.Length>0,"Selected mesh spot-check instance missing");
+     var renderers=containers[0].GetComponentsInChildren<Renderer>(true);Require(renderers.Length>0,"Spot-check renderer missing");Bounds bounds=renderers[0].bounds;foreach(var renderer in renderers)bounds.Encapsulate(renderer.bounds);
+     var parent=cameras.Single(c=>HierarchyPath(c.transform)==track.renderCameraPaths[0]);var clone=UnityEngine.Object.Instantiate(parent);clone.name="MySimSpotCheckCamera";
+     try {float radius=Math.Max(bounds.extents.magnitude,1e-5f);clone.transform.position=bounds.center-parent.transform.forward*(radius/Mathf.Sin(clone.fieldOfView*Mathf.Deg2Rad*.5f)*1.25f);clone.transform.LookAt(bounds.center);clone.nearClipPlane=Math.Max(radius*.001f,.00001f);clone.farClipPlane=Math.Max(parent.farClipPlane,radius*4);review.frames.Add(Capture(clone,id,"spot-"+id+".png"));}
+     finally {UnityEngine.Object.DestroyImmediate(clone.gameObject);}
+    }
+   }
+   review.imagesCaptured=true;review.sourceLightingPreserved=review.baselineLighting==review.candidateLighting;Require(review.sourceLightingPreserved,"Source lighting changed unexpectedly");
+   File.WriteAllText(Path.Combine(Output,"render-review.json"),JsonUtility.ToJson(review,true));
   }
   static void Build() {
    ImportPackages();Require(Config.buildScenes!=null&&Config.buildScenes.Length>0,"Explicit build scenes required");foreach(string scene in Config.buildScenes)Require(File.Exists(Full(scene)),"Build scene missing");
